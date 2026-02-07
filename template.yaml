@@ -44,9 +44,14 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: lambda_function.lambda_handler
-      Runtime: python3.12
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 5
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:445285296882:layer:perl-5-38-runtime-al2023-x86_64:1"
       Environment:
         Variables:
+          PERL5LIB: "/opt/lib/perl5/site_perl/5.38.2:/opt/lib"
           TABLE_NAME: !Ref TableName
           THUMB_BUCKET: !Ref ThumbBucketName
       Policies:

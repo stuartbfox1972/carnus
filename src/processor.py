@@ -1,124 +1,123 @@
-import subprocess
-import json
 import os
-import time
-import decimal
-import pygeohash as pgh
+import json
+import subprocess
 import boto3
+import pygeohash as pgh
+from datetime import datetime
 
-def run_processor(file_path, config, s3_client, rek_client, db_table):
-    """
-    Core logic to extract EXIF, generate a thumbnail, 
-    run Rekognition AI, and save results to DynamoDB.
-    """
-    # Helper for DynamoDB numeric compatibility
-    to_dec = lambda n: decimal.Decimal(str(round(float(n), 6)))
-    
-    # Detect if we are in Lambda vs Local to set binary path
-    if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
-        exif_exe = config['lambda_settings'].get('exiftool_path', './exiftool')
-    else:
-        exif_exe = 'exiftool'
+# --- Environment & Path Configuration ---
+# PERL_BIN comes from the Shogo82148 Lambda Layer
+PERL_BIN = "/opt/bin/perl"
+TASK_ROOT = os.environ.get('LAMBDA_TASK_ROOT', os.getcwd())
+EXIF_PATH = os.path.join(TASK_ROOT, "exiftool")
+EXIF_LIB  = os.path.join(TASK_ROOT, "lib")
 
-    filename = os.path.basename(file_path)
+# Clients
+s3 = boto3.client('s3')
+rekognition = boto3.client('rekognition')
+dynamodb = boto3.resource('dynamodb')
+
+# Environment Variables (Injected via template.yaml)
+DDB_TABLE = os.environ.get('DYNAMO_TABLE')
+THUMB_BUCKET = os.environ.get('THUMB_BUCKET')
+table = dynamodb.Table(DDB_TABLE)
+
+def run(bucket, key):
+    """
+    Main execution logic for processing a RAW image.
+    """
+    local_path = f"/tmp/{os.path.basename(key)}"
+    mapped_metadata = {}
 
     try:
-        # 1. Metadata Extraction
-        # -j: JSON output, -n: Numerical GPS coords
-        meta_proc = subprocess.run(
-            [exif_exe, '-j', '-n', file_path], 
-            capture_output=True, 
-            text=True
-        )
-        if meta_proc.returncode != 0:
-            print(f"❌ Exiftool Error for {filename}: {meta_proc.stderr}")
-            return False
-            
-        tags = json.loads(meta_proc.stdout)[0]
+        # 1. Download Asset from S3
+        print(f"📥 Downloading s3://{bucket}/{key}")
+        s3.download_file(bucket, key, local_path)
 
-        # 2. Thumbnail Extraction
-        # Extracts PreviewImage (large) or ThumbnailImage (small) to stdout
-        thumb_proc = subprocess.run(
-            [exif_exe, '-b', '-PreviewImage', '-ThumbnailImage', '-W', '-', file_path], 
-            capture_output=True
-        )
-        img_bytes = thumb_proc.stdout
+        # 2. Extract Text Metadata (Explicitly excluding large binary blobs)
+        # These exclusions prevent DynamoDB 'ItemSize' errors.
+        meta_cmd = [
+            PERL_BIN, "-I", EXIF_LIB, EXIF_PATH, "-json", "-G",
+            "--ThumbnailImage", "--PreviewImage", "--JpgFromRaw", "--OtherImage",
+            "--MakerNotes",
+            local_path
+        ]
+        meta_res = subprocess.run(meta_cmd, capture_output=True, text=True)
+        raw_exif = json.loads(meta_res.stdout)[0] if meta_res.returncode == 0 else {}
 
-        if not img_bytes:
-            print(f"⚠️ No embedded thumbnail found in {filename}. Skipping.")
-            return False
+        # 3. Extract Binary Image for Rekognition & S3 Thumbnails
+        # We try Thumbnail first, then fallback to PreviewImage
+        image_bytes = None
+        for tag in ["-ThumbnailImage", "-PreviewImage"]:
+            thumb_cmd = [PERL_BIN, "-I", EXIF_LIB, EXIF_PATH, "-b", tag, local_path]
+            res = subprocess.run(thumb_cmd, capture_output=True)
+            if res.stdout:
+                image_bytes = res.stdout
+                break
 
-        # 3. Date & Path Parsing
-        # Fallback sequence for missing dates
-        dt_str = tags.get('DateTimeOriginal', tags.get('CreateDate', '1970:01:01 00:00:00'))
-        dt_clean = dt_str[:19].replace('-', ':')
-        dt_struct = time.strptime(dt_clean, '%Y:%m:%d %H:%M:%S')
-        
-        epoch = str(int(time.mktime(dt_struct)))
-        s3_prefix = time.strftime('%Y/%m/%d', dt_struct)
-        dest_key = f"{s3_prefix}/{filename}.jpg"
+        # 4. AI Analysis & Thumbnail Storage
+        if image_bytes:
+            # Analyze with Rekognition (Byte-stream doesn't touch the disk)
+            print("🧠 Analyzing with Rekognition...")
+            rek_res = rekognition.detect_labels(
+                Image={'Bytes': image_bytes}, 
+                MaxLabels=15, 
+                MinConfidence=80
+            )
+            mapped_metadata['AI_Labels'] = [l['Name'] for l in rek_res['Labels']]
 
-        # 4. Upload Thumbnail to S3
-        # Uses the specific thumbnail bucket from universal config
-        s3_client.put_object(
-            Bucket=config['aws']['thumbnail_s3_bucket'],
-            Key=dest_key,
-            Body=img_bytes,
-            ContentType='image/jpeg'
-        )
+            # Upload Thumbnail to S3
+            thumb_key = os.path.splitext(key)[0] + ".jpg"
+            print(f"🖼️  Uploading thumbnail to s3://{THUMB_BUCKET}/{thumb_key}")
+            s3.put_object(
+                Bucket=THUMB_BUCKET,
+                Key=thumb_key,
+                Body=image_bytes,
+                ContentType='image/jpeg'
+            )
+            mapped_metadata['Thumbnail_S3_Key'] = thumb_key
+        else:
+            mapped_metadata['AI_Labels'] = []
+            print("⚠️ No thumbnail/preview found for AI analysis.")
 
-        # 5. AWS Rekognition (AI Object Detection)
-        labels = rek_client.detect_labels(
-            Image={'Bytes': img_bytes},
-            MaxLabels=config['ingestion']['max_labels'],
-            MinConfidence=config['ingestion']['min_confidence']
-        )['Labels']
+        # 5. Map Photographic Attributes (Using Composite tags for readability)
+        mapped_metadata.update({
+            'Make': raw_exif.get('EXIF:Make') or raw_exif.get('IPTC:Make', 'Unknown'),
+            'Model': raw_exif.get('EXIF:Model', 'Unknown'),
+            'Lens': raw_exif.get('Composite:LensID') or raw_exif.get('EXIF:LensModel', 'Unknown'),
+            'FocalLength': raw_exif.get('Composite:FocalLength') or raw_exif.get('EXIF:FocalLength', '0mm'),
+            'Aperture': raw_exif.get('Composite:Aperture', 'N/A'),
+            'ShutterSpeed': raw_exif.get('Composite:ShutterSpeed', 'N/A'),
+            'ISO': raw_exif.get('EXIF:ISO', 'Unknown'),
+            'DateTime': raw_exif.get('EXIF:DateTimeOriginal') or raw_exif.get('IPTC:DateCreated', 'Unknown')
+        })
 
-        # 6. DynamoDB Persistence
-        with db_table.batch_writer() as batch:
-            # Main Image Record
-            item = {
-                'PK': f"IMAGE#{filename}",
-                'SK': epoch,
-                'thumb_path': dest_key,
-                'camera': tags.get('Model', 'Unknown'),
-                'labels': [l['Name'] for l in labels],
-                # Clean EXIF: Remove binary data and very long strings for DDB limits
-                'exif': {k: str(v) for k, v in tags.items() if len(str(v)) < 250 and 'Binary' not in k}
-            }
+        # 6. Geospatial Processing
+        lat = raw_exif.get('EXIF:GPSLatitude')
+        lon = raw_exif.get('EXIF:GPSLongitude')
+        if lat and lon:
+            try:
+                mapped_metadata['Geohash'] = pgh.encode(float(lat), float(lon), precision=9)
+            except (ValueError, TypeError):
+                mapped_metadata['Geohash'] = "Error"
+        else:
+            mapped_metadata['Geohash'] = "None"
 
-            # Handle GPS and Geohash
-            lat, lon = tags.get('GPSLatitude'), tags.get('GPSLongitude')
-            if lat and lon:
-                ghash = pgh.encode(lat, lon, precision=config['geospatial']['precision'])
-                item.update({
-                    'latitude': to_dec(lat), 
-                    'longitude': to_dec(lon), 
-                    'geohash': ghash
-                })
-                
-                # Add entry to Geo-Bucket Index (e.g., GEO#abcde)
-                geo_prefix = ghash[:config['geospatial']['bucket_size']]
-                batch.put_item(Item={
-                    'PK': f"GEO#{geo_prefix}",
-                    'SK': f"IMAGE#{filename}",
-                    'thumb_path': dest_key,
-                    'full_hash': ghash
-                })
-
-            batch.put_item(Item=item)
-
-            # Add Label Indexing
-            for l in labels:
-                batch.put_item(Item={
-                    'PK': f"TAG#{l['Name'].upper()}",
-                    'SK': f"IMAGE#{filename}",
-                    'confidence': to_dec(l['Confidence']),
-                    'thumb_path': dest_key
-                })
-
-        return True
+        # 7. Persistence (Unpack metadata as top-level attributes)
+        print("💾 Saving record to DynamoDB...")
+        table.put_item(Item={
+            'PK': key,
+            'Bucket': bucket,
+            'ProcessedAt': datetime.utcnow().isoformat(),
+            **mapped_metadata,
+            'FullRawJSON': json.dumps(raw_exif) # Cleaned of binary blobs
+        })
 
     except Exception as e:
-        print(f"❌ Critical error processing {filename}: {str(e)}")
-        return False
+        print(f"❌ Error processing {key}: {str(e)}")
+        raise e
+
+    finally:
+        # Cleanup /tmp to prevent storage exhaustion on warm starts
+        if os.path.exists(local_path):
+            os.remove(local_path)
