@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+carnus_env/
+.venv/
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- AWS SAM ---
+.aws-sam/
+samconfig.toml
+event.json
+
+# --- Binaries & System ---
+# We ignore the local bin folder and the exiftool tarballs
+bin/
+*.tar.gz
+*.zip
+.DS_Store
+Thumbs.db
+
+# --- Carnus Specific ---
+# We ignore the temporary exiftool source in the root 
+# but we DO NOT ignore 'src/exiftool' as that needs to be committed 
+# for SAM to find it during build.
+Image-ExifTool-*/
+
+# --- Logs & Metadata ---
+*.log
+.idea/
+.vscode/
+*.swp
