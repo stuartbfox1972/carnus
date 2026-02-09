@@ -28,15 +28,29 @@ bin/
 .DS_Store
 Thumbs.db
 
-# --- Carnus Specific ---
-# We ignore the temporary exiftool source in the root 
-# but we DO NOT ignore 'src/exiftool' as that needs to be committed 
-# for SAM to find it during build.
-Image-ExifTool-*/
-frontend/src/amplify-config.js
-
 # --- Logs & Metadata ---
 *.log
 .idea/
 .vscode/
 *.swp
+
+# Dependency directories
+frontend/node_modules/
+node_modules/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output
+frontend/dist/
+frontend/build/
+
+# Local configuration & environment
+frontend/package-lock.json
+frontend/src/amplify-config.js
+config.yaml
+samconfig.toml
+template.yaml
+.aws-sam/
