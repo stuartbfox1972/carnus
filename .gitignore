@@ -33,6 +33,7 @@ Thumbs.db
 # but we DO NOT ignore 'src/exiftool' as that needs to be committed 
 # for SAM to find it during build.
 Image-ExifTool-*/
+frontend/src/amplify-config.js
 
 # --- Logs & Metadata ---
 *.log

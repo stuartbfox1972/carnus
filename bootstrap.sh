@@ -10,6 +10,18 @@ echo "🛠️  Starting Carnus Repository Bootstrap (v${EXIFTOOL_VERSION})..."
 # 1. System Setup
 sudo apt-get update -qq
 sudo apt-get install -y build-essential wget python3-venv python3-pip zip awscli unzip -qq
+
+if ! command -v sam &> /dev/null; then
+    echo "🏗️  Installing AWS SAM CLI..."
+    wget -q https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+    unzip -q aws-sam-cli-linux-x86_64.zip -d sam-installation
+    sudo ./sam-installation/install --update
+    rm -rf sam-installation aws-sam-cli-linux-x86_64.zip
+    echo "✅ SAM CLI installed: $(sam --version)"
+else
+    echo "✅ SAM CLI already installed: $(sam --version)"
+fi
+
 mkdir -p src/
 
 # 2. Python Environment Setup

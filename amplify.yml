@@ -1,0 +1,23 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+        # Pull the real IDs from the Stack Name injected by our handshake script
+        - USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+        - CLIENT_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+        - API_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='CarnusApiUrl'].OutputValue" --output text)
+        # Write the config
+        - |
+          echo "export const amplifyConfig = {
+            Auth: { Cognito: { userPoolId: '$USER_POOL_ID', userPoolClientId: '$CLIENT_ID' } },
+            API: { REST: { CarnusApi: { endpoint: '$API_URL', region: '$AWS_REGION' } } }
+          };" > frontend/src/amplify-config.js
+    build:
+      commands:
+        - cd frontend && npm run build
+  artifacts:
+    baseDirectory: frontend/dist
+    files:
+      - '**/*'
