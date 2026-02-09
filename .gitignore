@@ -15,6 +15,10 @@ pip-delete-this-directory.txt
 .aws-sam/
 samconfig.toml
 event.json
+template.yaml
+src/exiftool
+src/lib/
+config.yaml
 
 # --- Binaries & System ---
 # We ignore the local bin folder and the exiftool tarballs

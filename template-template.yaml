@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: "Carnus-xxxxx"
+  TableName:
+    Type: String
+    Default: "carnus-metadata-xxxxx"
+  RawBucketName:
+    Type: String
+    Default: "carnus-raw-xxxxx"
+  ThumbBucketName:
+    Type: String
+    Default: "carnus-thumbs-xxxxx"
+
+Globals:
+  Function:
+    Timeout: 15  # Keep this under 29 to let Lambda fail gracefully
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref TableName
+
+Resources:
+  CarnusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - Timestamp
+              - ThumbnailKey
+      BillingMode: PAY_PER_REQUEST
+
+  RawSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucketName
+
+  ThumbnailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ThumbBucketName
+
+
+  CarnusUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref EnvironmentName
+      # This is the "magic" line for email-only login
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+
+  CarnusUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref CarnusUserPool
+      ClientName: carnus-web-client
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH        # Recommended for Web/Amplify
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH   # Keep for your CLI testing
+
+  UserPoolPostConfirmationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CarnusUserPool.Arn
+
+  CarnusApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      # Enables CORS for your frontend
+      Cors:
+        AllowMethods: "'GET,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+      - ResourcePath: '/*'
+        HttpMethod: '*'
+        LoggingLevel: INFO
+        DataTraceEnabled: True
+        MetricsEnabled: True
+      Auth:
+        DefaultAuthorizer: MyCognitoAuthorizer
+        Authorizers:
+          MyCognitoAuthorizer:
+            UserPoolArn: !GetAtt CarnusUserPool.Arn
+        AddDefaultAuthorizerToCorsPreflight: False
+
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/triggers/
+      Handler: post_confirmation.handler
+      Runtime: python3.13
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+
+  TagsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/tags/
+      Handler: tag_handler.handler
+      Runtime: python3.13
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TableName
+      Events:
+        # Route: GET /tags
+        GetTagCloud:
+          Type: Api
+          Properties:
+            Path: /tags
+            Method: get
+            RestApiId: !Ref CarnusApi
+        # Route: GET /tags/{tag_name}
+        GetTagImages:
+          Type: Api
+          Properties:
+            Path: /tags/{tag_name}
+            Method: get
+            RestApiId: !Ref CarnusApi
+
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/processor/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:445285296882:layer:perl-5-38-runtime-al2023-x86_64:1"
+      Environment:
+        Variables:
+          PERL5LIB: "/opt/lib/perl5/site_perl/5.38.2:/opt/lib"
+          TABLE_NAME: !Ref TableName
+          THUMB_BUCKET: !Ref ThumbBucketName
+      Policies:
+        - S3ReadPolicy: { BucketName: !Ref RawBucketName }
+        - S3WritePolicy: { BucketName: !Ref ThumbBucketName }
+        - DynamoDBCrudPolicy: { TableName: !Ref TableName }
+        - RekognitionDetectOnlyPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              # This targets the GSI specifically
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/GSI1"
+      Events:
+        FileUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawSourceBucket
+            Events: s3:ObjectCreated:*
+
+
+Outputs:
+  # This provides the base URL for the entire API
+  CarnusApiUrl:
+    Description: "Base URL for the Carnus REST API"
+    Value: !Sub "https://${CarnusApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+
+  # This specifically points to the Tag Cloud endpoint
+  TagCloudEndpoint:
+    Description: "Endpoint for the Tag Cloud JSON"
+    Value: !Sub "https://${CarnusApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/tags"
