@@ -4,7 +4,7 @@
 # Replace these with your actual IDs from SAM Outputs
 USER_POOL_ID="USERPOOLID"
 CLIENT_ID="CLIENTID"
-API_ENDPOINT="https://APIGATEWAY/Prod/tags/Bird"
+API_ENDPOINT="https://APIGATEWAY/Prod/tags"
 
 EMAIL="EMAIL"
 PASSWORD="PASSWORD"

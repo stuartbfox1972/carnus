@@ -15,9 +15,10 @@ Parameters:
     Type: String
     Default: "carnus-thumbs-xxxxx"
 
+
 Globals:
   Function:
-    Timeout: 15  # Keep this under 29 to let Lambda fail gracefully
+    Timeout: 15
     MemorySize: 512
     Environment:
       Variables:
@@ -37,12 +38,28 @@ Resources:
           AttributeType: S
         - AttributeName: GSI1SK
           AttributeType: S
+        - AttributeName: ImageId
+          AttributeType: S
+        - AttributeName: CaptureDate
+          AttributeType: S
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
         - AttributeName: SK
           KeyType: RANGE
+      # Added to support the 24-hour cache expiration
+      TimeToLiveSpecification:
+        AttributeName: TimeToLive
+        Enabled: true
       GlobalSecondaryIndexes:
+        - IndexName: ImageIdIndex
+          KeySchema:
+            - AttributeName: ImageId
+              KeyType: HASH
+            - AttributeName: CaptureDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
         - IndexName: GSI1
           KeySchema:
             - AttributeName: GSI1PK
@@ -54,6 +71,7 @@ Resources:
             NonKeyAttributes:
               - Timestamp
               - ThumbnailKey
+              - ImageName
       BillingMode: PAY_PER_REQUEST
 
   RawSourceBucket:
@@ -66,12 +84,10 @@ Resources:
     Properties:
       BucketName: !Ref ThumbBucketName
 
-
   CarnusUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: !Ref EnvironmentName
-      # This is the "magic" line for email-only login
       UsernameAttributes:
         - email
       AdminCreateUserConfig:
@@ -92,9 +108,9 @@ Resources:
       UserPoolId: !Ref CarnusUserPool
       ClientName: carnus-web-client
       ExplicitAuthFlows:
-        - ALLOW_USER_SRP_AUTH        # Recommended for Web/Amplify
+        - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
-        - ALLOW_USER_PASSWORD_AUTH   # Keep for your CLI testing
+        - ALLOW_USER_PASSWORD_AUTH
 
   UserPoolPostConfirmationPermission:
     Type: AWS::Lambda::Permission
@@ -108,11 +124,6 @@ Resources:
     Type: AWS::Serverless::Api
     Properties:
       StageName: Prod
-      # Enables CORS for your frontend
-      Cors:
-        AllowMethods: "'GET,OPTIONS'"
-        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
-        AllowOrigin: "'*'"
       MethodSettings:
       - ResourcePath: '/*'
         HttpMethod: '*'
@@ -147,24 +158,73 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref TableName
+          THUMB_BUCKET: !Ref ThumbBucketName
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref TableName
+        - S3ReadPolicy:
+            BucketName: !Ref ThumbBucketName
       Events:
-        # Route: GET /tags
         GetTagCloud:
           Type: Api
           Properties:
             Path: /tags
             Method: get
             RestApiId: !Ref CarnusApi
-        # Route: GET /tags/{tag_name}
         GetTagImages:
           Type: Api
           Properties:
             Path: /tags/{tag_name}
             Method: get
             RestApiId: !Ref CarnusApi
+
+  ImageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/image/
+      Handler: image_handler.handler
+      Runtime: python3.13
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          THUMB_BUCKET: !Ref ThumbBucketName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TableName
+        - S3ReadPolicy:
+            BucketName: !Ref ThumbBucketName
+      Events:
+        GetImage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CarnusApi
+            Path: /image/{image_id}
+            Method: GET
+
+  StatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/stats/
+      Handler: stats_handler.handler
+      Runtime: python3.13
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+          THUMB_BUCKET: !Ref ThumbBucketName
+          STATS_CACHE_ENABLED: "false"
+      Policies:
+        # CRUD policy required to write the summary attribute back to the table
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+        - S3ReadPolicy:
+            BucketName: !Ref ThumbBucketName
+      Events:
+        GetStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CarnusApi
+            Path: /stats
+            Method: GET
 
   ProcessorFunction:
     Type: AWS::Serverless::Function
@@ -188,7 +248,6 @@ Resources:
             - Effect: Allow
               Action:
                 - dynamodb:Query
-              # This targets the GSI specifically
               Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TableName}/index/GSI1"
       Events:
         FileUpload:
@@ -197,14 +256,13 @@ Resources:
             Bucket: !Ref RawSourceBucket
             Events: s3:ObjectCreated:*
 
-
 Outputs:
-  # This provides the base URL for the entire API
   CarnusApiUrl:
     Description: "Base URL for the Carnus REST API"
     Value: !Sub "https://${CarnusApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
-
-  # This specifically points to the Tag Cloud endpoint
-  TagCloudEndpoint:
-    Description: "Endpoint for the Tag Cloud JSON"
-    Value: !Sub "https://${CarnusApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/tags"
+  UserPoolId:
+    Value: !Ref CarnusUserPool
+  UserPoolClientId:
+    Value: !Ref CarnusUserPoolClient
+  Region:
+    Value: !Ref "AWS::Region"

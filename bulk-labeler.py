@@ -3,6 +3,7 @@ import sys
 import yaml
 import boto3
 import concurrent.futures
+from tqdm import tqdm
 from src.processor.processor import process_image
 
 def main():
@@ -40,7 +41,7 @@ def main():
     # 5. Gather Files Recursively (os.walk)
     exts = tuple(cfg['ingestion']['extensions'])
     files = []
-    
+
     print(f"🔍 Searching for photos in {photo_dir}...")
     for root, _, filenames in os.walk(photo_dir):
         for f in filenames:
@@ -52,14 +53,26 @@ def main():
         return
 
     print(f"🚀 Found {len(files)} files. Starting processing...")
-    print(f"⚙️  Settings: Force={settings['force_reprocess']}, Debug={settings['debug']}")
+    print(f"⚙️  Settings: Force={settings['force_reprocess']}, Debug={settings['debug']}\n")
 
-    # 6. Parallel Execution via ThreadPool
+    # 6. Parallel Execution via ThreadPool with Progress Bar
     max_workers = cfg['ingestion'].get('max_workers', 10)
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Pass each absolute file path to the processor
-        futures = [executor.submit(process_image, f, settings, s3, rek, table) for f in files]
-        concurrent.futures.wait(futures)
+        # Submit all tasks
+        futures = {executor.submit(process_image, f, settings, s3, rek, table): f for f in files}
+        
+        # tqdm context manager for the progress bar
+        # total=len(files) gives us the "0/266" counter
+        with tqdm(total=len(files), desc="Processing Photos", unit="img") as pbar:
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result() # Check for exceptions in threads
+                except Exception as e:
+                    filename = futures[future]
+                    print(f"\n❌ Error processing {filename}: {e}")
+                
+                pbar.update(1) # Advance the counter by 1
 
     print(f"\n✅ Finished processing {len(files)} files.")
 

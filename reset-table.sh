@@ -27,13 +27,14 @@ if [[ "$CONFIRM" != "yes" && "$CONFIRM" != "y" ]]; then
     exit 1
 fi
 
-# 4. Teardown and Rebuild (Output redirected to /dev/null)
+# 4. Teardown
 echo "🗑️  Deleting table: $TABLE_NAME..."
 aws dynamodb delete-table --table-name "$TABLE_NAME" > /dev/null 2>&1
 
 echo "⏳ Waiting for deletion to complete..."
 aws dynamodb wait table-not-exists --table-name "$TABLE_NAME"
 
+# 5. Rebuild with new Indexing Strategy
 echo "🏗️  Creating fresh table: $TABLE_NAME..."
 aws dynamodb create-table \
     --table-name "$TABLE_NAME" \
@@ -42,9 +43,12 @@ aws dynamodb create-table \
         AttributeName=SK,AttributeType=S \
         AttributeName=GSI1PK,AttributeType=S \
         AttributeName=GSI1SK,AttributeType=S \
+        AttributeName=ImageId,AttributeType=S \
+        AttributeName=CaptureDate,AttributeType=S \
     --key-schema \
         AttributeName=PK,KeyType=HASH \
         AttributeName=SK,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST \
     --global-secondary-indexes \
         "[
             {
@@ -54,13 +58,26 @@ aws dynamodb create-table \
                     {\"AttributeName\":\"GSI1SK\",\"KeyType\":\"RANGE\"}
                 ],
                 \"Projection\": {
-                    \"ProjectionType\":\"ALL\"
+                    \"ProjectionType\": \"INCLUDE\",
+                    \"NonKeyAttributes\": [\"ImageName\", \"ImageId\", \"ThumbnailKey\", \"Timestamp\"]
+                }
+            },
+            {
+                \"IndexName\": \"ImageIdIndex\",
+                \"KeySchema\": [
+                    {\"AttributeName\":\"ImageId\",\"KeyType\":\"HASH\"},
+                    {\"AttributeName\":\"CaptureDate\",\"KeyType\":\"RANGE\"}
+                ],
+                \"Projection\": {
+                    \"ProjectionType\": \"ALL\"
                 }
             }
-        ]" \
-    --billing-mode PAY_PER_REQUEST > /dev/null 2>&1
+        ]"
 
 echo "⏳ Waiting for table to become ACTIVE..."
 aws dynamodb wait table-exists --table-name "$TABLE_NAME"
 
-echo "✅ Success! $TABLE_NAME has been reset and is ready for use."
+echo "--------------------------------------------------------"
+echo "✅ SUCCESS: $TABLE_NAME is fresh and ready."
+echo "🚀 You can now run bulk-labeler.py to re-populate."
+echo "--------------------------------------------------------"

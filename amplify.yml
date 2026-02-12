@@ -3,21 +3,27 @@ frontend:
   phases:
     preBuild:
       commands:
-        - npm ci
-        # Pull the real IDs from the Stack Name injected by our handshake script
-        - USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
-        - CLIENT_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
-        - API_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='CarnusApiUrl'].OutputValue" --output text)
-        # Write the config
+        # Move into frontend for all operations
+        - cd frontend
+        # Use install because we are ignoring the lockfile in Git
+        - npm install
+        # Pull the real IDs using the STACK_NAME injected by setup-frontend.sh
         - |
+          USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolId'].OutputValue" --output text)
+          CLIENT_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='UserPoolClientId'].OutputValue" --output text)
+          API_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='CarnusApiUrl'].OutputValue" --output text)
           echo "export const amplifyConfig = {
             Auth: { Cognito: { userPoolId: '$USER_POOL_ID', userPoolClientId: '$CLIENT_ID' } },
             API: { REST: { CarnusApi: { endpoint: '$API_URL', region: '$AWS_REGION' } } }
-          };" > frontend/src/amplify-config.js
+          };" > src/amplify-config.js
     build:
       commands:
-        - cd frontend && npm run build
+        # We are already in the frontend directory from preBuild
+        - npm run build
   artifacts:
     baseDirectory: frontend/dist
     files:
       - '**/*'
+  cache:
+    paths:
+      - frontend/node_modules/**/*
