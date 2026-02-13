@@ -23,6 +23,7 @@ config.yaml
 # --- Binaries & System ---
 # We ignore the local bin folder and the exiftool tarballs
 bin/
+ignore/
 *.tar.gz
 *.zip
 .DS_Store

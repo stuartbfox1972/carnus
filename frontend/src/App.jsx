@@ -7,15 +7,12 @@ import ImageModal from './components/ImageModal';
 import '@aws-amplify/ui-react/styles.css';
 
 const globalStyles = `
-  .pill-bar-container { display: flex; overflow-x: auto; gap: 8px; padding: 15px 0; border-bottom: 1px solid #e2e8f0; scrollbar-width: none; }
-  .ai-pill { white-space: nowrap; padding: 6px 16px; border-radius: 20px; font-size: 13px; background: #f1f5f9; cursor: pointer !important; transition: all 0.2s; }
-  .ai-pill:hover { background: #e2e8f0; }
-  .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.9); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 20px; backdrop-filter: blur(4px); }
-  .pivot-link { cursor: pointer !important; color: #3b82f6; text-decoration: underline; font-weight: bold; }
-  .status-pill { padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: bold; cursor: pointer !important; border: none; color: white; margin: 3px; background: #3b82f6; }
+  .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.9); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .ai-pill { cursor: pointer; transition: all 0.2s; }
+  .ai-pill:hover { transform: scale(1.05); background: #dbeafe !important; }
 `;
 
-function Dashboard() {
+function Dashboard({ signOut, user }) {
   const [tags, setTags] = useState([]);
   const [images, setImages] = useState([]);
   const [selectedTag, setSelectedTag] = useState(null);
@@ -24,32 +21,31 @@ function Dashboard() {
   const [nextKey, setNextKey] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // Fetch the main tag list for the TagCloud
+  // Fetch initial TagCloud
   const fetchTags = async () => {
     try {
       const session = await fetchAuthSession();
-      const response = await fetch('/tags', {
-        headers: { 'Authorization': session.tokens?.idToken?.toString() }
-      });
+      const token = session.tokens?.idToken?.toString();
+      const response = await fetch('/tags', { headers: { 'Authorization': token } });
       const data = await response.json();
-      // Normalized to match expected component props
-      setTags(data.map(item => ({ 
-        LabelName: item.Text, 
-        Count: item.Count,
-        SK: `TAG#${item.Text}` 
-      })));
-    } catch (e) {
-      console.error("Error fetching tags:", e);
-    }
+      if (Array.isArray(data)) {
+        setTags(data.map(item => ({
+          LabelName: item.Text,
+          Count: item.Count,
+          SK: `TAG#${item.Text}`
+        })));
+      }
+    } catch (e) { console.error("Tag Fetch Error:", e); }
   };
 
-  // Main navigation and search handler
+  // The pivot function used by TagCloud AND ImageModal pills
   const handleTagClick = async (tagValue, isLoadMore = false) => {
+    if (!tagValue) return;
+    
+    // Normalize tag for DynamoDB GSI (TAG#Name)
     const dbTag = tagValue.startsWith('TAG#') ? tagValue : `TAG#${tagValue}`;
-
-    // UI resets: Close modal and set selection
     setSelectedTag(dbTag);
-    setSelectedImage(null); 
+    setSelectedImage(null); // Close modal if open
 
     if (!isLoadMore) {
       setImages([]);
@@ -65,68 +61,78 @@ function Dashboard() {
 
       const response = await fetch(url, { headers: { 'Authorization': token } });
       const data = await response.json();
-
-      if (data && data.items) {
+      if (data?.items) {
         setImages(prev => isLoadMore ? [...prev, ...data.items] : data.items);
         setNextKey(data.next_token || null);
       }
     } catch (err) {
-      console.error("Error fetching gallery:", err);
+      console.error("Gallery Fetch Error:", err);
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { fetchTags(); }, []);
+  // Fetch the full image data (with Labels) when thumbnail is clicked
+  const handleImageClick = async (galleryItem) => {
+    try {
+      const session = await fetchAuthSession();
+      const token = session.tokens?.idToken?.toString();
+      
+      const response = await fetch(`/image/${galleryItem.ImageId}`, {
+        headers: { 'Authorization': token }
+      });
+      
+      if (!response.ok) throw new Error("Failed to fetch full image details");
+      const fullImageData = await response.json();
+      
+      setSelectedImage(fullImageData);
+    } catch (err) {
+      console.error("Detail Fetch Error:", err);
+      setSelectedImage(galleryItem); // Fallback to shallow data
+    }
+  };
+
+  useEffect(() => { if (user) fetchTags(); }, [user]);
 
   return (
     <div style={{ minHeight: '100vh', background: '#f8f9fa' }}>
       <style>{globalStyles}</style>
 
       <header style={{ background: '#232f3e', color: 'white', padding: '1rem 2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <strong
-          onClick={() => { setSelectedTag(null); setImages([]); }}
-          style={{ cursor: 'pointer', fontSize: '1.2rem', letterSpacing: '1px' }}
-        >
-          CARNUS CONSOLE
-        </strong>
-        <Authenticator>
-          {({ signOut }) => <button onClick={signOut} style={{ cursor: 'pointer' }}>Sign Out</button>}
-        </Authenticator>
+        <strong onClick={() => window.location.reload()} style={{ cursor: 'pointer' }}>CARNUS CONSOLE</strong>
+        <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
+          <span>{user?.username}</span>
+          <button onClick={signOut} style={{ padding: '5px 15px', borderRadius: '4px', cursor: 'pointer' }}>Sign Out</button>
+        </div>
       </header>
 
       <main style={{ padding: '40px', maxWidth: '1200px', margin: '0 auto' }}>
+        
+        {/* IMPORTANT: Passing onTagClick here so pills can trigger handleTagClick */}
+        {selectedImage && (
+          <ImageModal 
+            image={selectedImage} 
+            onClose={() => setSelectedImage(null)} 
+            onTagClick={handleTagClick} 
+          />
+        )}
 
-        {/* MODAL: Handles details and hardware pivots */}
-        <ImageModal
-          image={selectedImage}
-          onClose={() => setSelectedImage(null)}
-          onTagClick={handleTagClick}
-        />
-
-        {/* VIEW LOGIC: Cloud vs Gallery */}
         {!selectedTag ? (
-          <TagCloud
-            tags={tags}
-            searchQuery={searchQuery}
-            onSearchChange={setSearchQuery}
-            onTagClick={handleTagClick}
+          <TagCloud 
+            tags={tags} 
+            searchQuery={searchQuery} 
+            onSearchChange={setSearchQuery} 
+            onTagClick={handleTagClick} 
           />
         ) : (
-          <div style={{ marginTop: '20px' }}>
-            {loading && images.length === 0 ? (
-              <div style={{ textAlign: 'center', marginTop: '100px' }}><h3>Loading items...</h3></div>
-            ) : (
-              <GalleryGrid
-                images={images}
-                selectedTag={selectedTag}
-                onImageClick={setSelectedImage}
-                onBack={() => { setSelectedTag(null); setImages([]); }}
-                nextKey={nextKey}
-                onLoadMore={() => handleTagClick(selectedTag, true)}
-              />
-            )}
-          </div>
+          <GalleryGrid
+            images={images}
+            selectedTag={selectedTag}
+            onImageClick={handleImageClick}
+            onBack={() => { setSelectedTag(null); setImages([]); }}
+            nextKey={nextKey}
+            onLoadMore={() => handleTagClick(selectedTag, true)}
+          />
         )}
       </main>
     </div>
@@ -136,7 +142,9 @@ function Dashboard() {
 export default function App() {
   return (
     <Authenticator.Provider>
-      <Dashboard />
+      <Authenticator>
+        {({ signOut, user }) => <Dashboard signOut={signOut} user={user} />}
+      </Authenticator>
     </Authenticator.Provider>
   );
 }

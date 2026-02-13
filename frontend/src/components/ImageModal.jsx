@@ -1,106 +1,162 @@
-import React from 'react';
+import React, { useState } from 'react';
 
 const ImageModal = ({ image, onClose, onTagClick }) => {
+  const [hoveredFace, setHoveredFace] = useState(null);
+
   if (!image) return null;
 
-  const hardwareKeys = ['Make', 'CameraModel', 'Lens', 'Aperture', 'ShutterSpeed', 'ISO', 'FocalLength'];
-  const blacklist = ['Labels', 'Faces', 'DetailUrl', 'ThumbnailUrl', 'ImageId', 'ThumbnailKey', 'PK', 'SK', 'ProcessedAt', 'ImageName', 'Tag'];
+  const imageUrl = image.DetailUrl || image.ThumbnailUrl;
+  const labels = image.Labels || [];
+  const faces = image.Faces || [];
 
-  // Sort entries so hardware info appears first
-  const sortedEntries = Object.entries(image)
-    .filter(([k]) => !blacklist.includes(k))
-    .sort((a, b) => {
-      const aIndex = hardwareKeys.indexOf(a[0]);
-      const bIndex = hardwareKeys.indexOf(b[0]);
-      if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
-      if (aIndex !== -1) return -1;
-      if (bIndex !== -1) return 1;
-      return a[0].localeCompare(b[0]);
-    });
+  // Helper to match DynamoDB TAG# logic: "HAPPY" -> "Happy", "EyesOpen" -> "Eyes Open"
+  const normalizeTag = (str) => {
+    if (!str) return '';
+    // First, split camelCase (EyesOpen -> Eyes Open)
+    const spaced = str.replace(/([A-Z])/g, ' $1').trim();
+    // Then capitalize first letter of each word
+    return spaced.split(' ')
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ');
+  };
+
+  const renderDynamicPill = (key, value) => {
+    const blacklist = ['BoundingBox', 'Confidence', 'Landmarks', 'Emotions'];
+    if (blacklist.includes(key) || !value) return null;
+
+    let displayLabel = key;
+    let searchTag = key;
+
+    if (key === 'AgeRange') {
+      displayLabel = `Age ${value.Low}-${value.High}`;
+      searchTag = displayLabel;
+    } else if (typeof value === 'boolean') {
+      if (value === false) return null;
+      searchTag = normalizeTag(key); // "EyesOpen" -> "Eyes Open"
+      displayLabel = searchTag.toUpperCase();
+    } else if (typeof value === 'string') {
+      searchTag = normalizeTag(value); // "FEMALE" -> "Female"
+      displayLabel = value.toUpperCase();
+    }
+
+    return (
+      <button
+        key={key}
+        onClick={() => { onTagClick(searchTag); onClose(); }}
+        style={styles.facePill}
+      >
+        {displayLabel}
+      </button>
+    );
+  };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div 
-        style={{ 
-          background: 'white', 
-          borderRadius: '12px', 
-          maxWidth: '900px', 
-          width: '95%', 
-          maxHeight: '95vh', 
-          overflow: 'hidden', 
-          position: 'relative',
-          display: 'flex',
-          flexDirection: 'column'
-        }} 
-        onClick={e => e.stopPropagation()}
-      >
-        {/* Header Area: Image and Face Boxes */}
-        <div style={{ padding: '20px', background: '#0f172a', textAlign: 'center', flexShrink: 0 }}>
-          <div style={{ position: 'relative', display: 'inline-block' }}>
-            <img 
-              src={image.DetailUrl || image.ThumbnailUrl} 
-              style={{ maxHeight: '50vh', maxWidth: '100%', borderRadius: '4px' }} 
-              alt={image.ImageName} 
-            />
-            {/* Face Bounding Boxes */}
-            {image.Faces?.map((f, i) => (
-              <div key={i} style={{
-                position: 'absolute', 
-                border: '2px solid #3b82f6', 
-                background: 'rgba(59, 130, 246, 0.2)',
-                left: `${f.BoundingBox.Left * 100}%`, 
-                top: `${f.BoundingBox.Top * 100}%`,
-                width: `${f.BoundingBox.Width * 100}%`, 
-                height: `${f.BoundingBox.Height * 100}%`, 
-                pointerEvents: 'none'
-              }} />
+    <div className="modal-overlay" onClick={onClose} style={styles.overlay}>
+      <div className="modal-content" onClick={(e) => e.stopPropagation()} style={styles.content}>
+        
+        {/* IMAGE & FACE BOXES */}
+        <div 
+          style={{ position: 'relative', width: '100%', marginBottom: '20px' }}
+          onMouseLeave={() => setHoveredFace(null)} 
+        >
+          <img src={imageUrl} alt="Detail" style={styles.mainImage} />
+          
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={styles.svgOverlay}>
+            {faces.map((face, i) => (
+              <rect
+                key={i}
+                x={face.BoundingBox.Left * 100}
+                y={face.BoundingBox.Top * 100}
+                width={face.BoundingBox.Width * 100}
+                height={face.BoundingBox.Height * 100}
+                fill="transparent"
+                stroke="#ef4444"
+                strokeWidth="0.8"
+                style={{ cursor: 'pointer', pointerEvents: 'auto' }}
+                onMouseEnter={() => setHoveredFace(face)}
+              />
             ))}
-          </div>
+          </svg>
 
-          {/* AI Labels Pivot Bar */}
-          <div style={{ marginTop: '15px', display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '8px' }}>
-            {image.Labels?.map(l => (
-              <button 
-                key={l} 
-                className="status-pill" 
-                onClick={() => onTagClick(l)}
-              >
-                {l}
-              </button>
-            ))}
-          </div>
+          {/* ATTRIBUTE POPUP */}
+          {hoveredFace && (
+            <div style={{
+              ...styles.popup,
+              left: `${(hoveredFace.BoundingBox.Left + hoveredFace.BoundingBox.Width) * 100}%`,
+              top: `${hoveredFace.BoundingBox.Top * 100}%`,
+            }}>
+              <div style={styles.popupHeader}>FACE DATA</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                
+                {/* 1. Attributes (Gender, Age, Booleans) */}
+                {Object.keys(hoveredFace).map(key => renderDynamicPill(key, hoveredFace[key]))}
+
+                {/* 2. Emotions (Normalized for search) */}
+                {hoveredFace.Emotions?.map((emo) => (
+                  <button 
+                    key={emo} 
+                    onClick={() => { onTagClick(normalizeTag(emo)); onClose(); }} 
+                    style={styles.emotionPill}
+                  >
+                    {emo.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
-        {/* Data Area: Hardware and EXIF */}
-        <div style={{ padding: '25px', overflowY: 'auto', flexGrow: 1 }}>
-          <h4 style={{ marginTop: 0, marginBottom: '15px', color: '#64748b', fontSize: '12px', textTransform: 'uppercase' }}>
-            Image Metadata - {image.ImageName}
-          </h4>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', background: '#e2e8f0', gap: '1px', border: '1px solid #e2e8f0' }}>
-            {sortedEntries.map(([k, v]) => (
-              <React.Fragment key={k}>
-                <div style={{ background: '#f8fafc', padding: '12px', fontSize: '11px', fontWeight: 'bold', color: '#475569' }}>
-                  {k}
-                </div>
-                <div style={{ background: 'white', padding: '12px', fontSize: '13px', color: '#1e293b' }}>
-                  {hardwareKeys.includes(k) ? (
-                    <span 
-                      className="pivot-link" 
-                      onClick={() => onTagClick(String(v))}
-                    >
-                      {String(v)}
-                    </span>
-                  ) : (
-                    String(v)
-                  )}
-                </div>
-              </React.Fragment>
-            ))}
-          </div>
+        {/* BLUE PILL BAR (Standard AI Labels) */}
+        <div style={styles.labelBar}>
+          {labels.map((tag, i) => (
+            <button 
+              key={i} 
+              onClick={() => { onTagClick(normalizeTag(tag)); onClose(); }} 
+              style={styles.bluePill}
+            >
+              {tag}
+            </button>
+          ))}
         </div>
       </div>
     </div>
   );
+};
+
+const styles = {
+  overlay: {
+    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(15, 23, 42, 0.95)', display: 'flex', 
+    alignItems: 'center', justifyContent: 'center', zIndex: 1000
+  },
+  content: {
+    background: 'white', padding: '24px', borderRadius: '16px',
+    maxWidth: '900px', width: '95%', maxHeight: '95vh', overflowY: 'auto'
+  },
+  mainImage: { width: '100%', borderRadius: '12px', display: 'block' },
+  svgOverlay: { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' },
+  popup: {
+    position: 'absolute', background: 'white', border: '1px solid #ef4444', 
+    borderRadius: '8px', padding: '12px', zIndex: 10, boxShadow: '0 10px 15px -3px rgba(0,0,0,0.2)',
+    minWidth: '160px', marginLeft: '10px'
+  },
+  popupHeader: { fontWeight: 'bold', marginBottom: '8px', fontSize: '10px', color: '#94a3b8', letterSpacing: '0.05em' },
+  facePill: {
+    background: '#f8fafc', color: '#475569', border: '1px solid #e2e8f0', 
+    padding: '5px 10px', borderRadius: '4px', fontSize: '11px', fontWeight: '800', 
+    cursor: 'pointer', textAlign: 'left'
+  },
+  emotionPill: {
+    background: '#fee2e2', color: '#b91c1c', border: 'none', 
+    padding: '5px 10px', borderRadius: '4px', fontSize: '11px', 
+    fontWeight: '800', cursor: 'pointer', textAlign: 'left'
+  },
+  labelBar: { display: 'flex', gap: '8px', flexWrap: 'wrap', borderTop: '1px solid #f1f5f9', paddingTop: '20px' },
+  bluePill: {
+    background: '#eff6ff', color: '#1d4ed8', border: '1px solid #dbeafe', 
+    padding: '6px 14px', borderRadius: '20px', fontSize: '13px', 
+    fontWeight: '600', cursor: 'pointer'
+  }
 };
 
 export default ImageModal;
