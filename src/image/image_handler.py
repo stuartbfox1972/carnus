@@ -18,24 +18,24 @@ dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(os.environ['TABLE_NAME'])
 
 def handler(event, context):
+    user_id = event['requestContext']['authorizer']['sub']
     image_id = event.get('pathParameters', {}).get('image_id')
 
     try:
-        # 1. Fetch image record via GSI
-        response = table.query(
-            IndexName='ImageIdIndex',
-            KeyConditionExpression=Key('ImageId').eq(image_id)
+        # 1. Direct Point Read from User-Image Partition
+        response = table.get_item(
+            Key={
+                'PK': f"USER#{user_id}#IMAGE",
+                'SK': f"IMAGE#{image_id}"
+            }
         )
+        item = response.get('Item')
 
-        items = response.get('Items', [])
-        if not items:
+        if not item:
             return {
                 "statusCode": 404,
-                "headers": { "Access-Control-Allow-Origin": "*" },
                 "body": json.dumps({"error": "Image not found"})
             }
-
-        item = items[0]
 
         # 2. Generate 15-minute Presigned URLs (900 seconds)
         thumb_key = item.get('ThumbnailKey')
@@ -43,7 +43,7 @@ def handler(event, context):
             signed_url = s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': os.environ['THUMB_BUCKET'], 'Key': thumb_key},
-                ExpiresIn=900 
+                ExpiresIn=900
             )
             item['DetailUrl'] = signed_url
             item['ThumbnailUrl'] = signed_url
@@ -55,17 +55,16 @@ def handler(event, context):
         # Exclude internal DynamoDB keys and the heavy Exif blob
         blacklist_prefixes = ('GSI', 'PK', 'SK')
         blacklist_exact = ('exif',)
-        
+
         clean_item = {
-            k: v for k, v in item.items() 
+            k: v for k, v in item.items()
             if not k.startswith(blacklist_prefixes) and k not in blacklist_exact
         }
 
         return {
             "statusCode": 200,
-            "headers": { 
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*" 
+            "headers": {
+                "Content-Type": "application/json"
             },
             "body": json.dumps(clean_item, cls=DecimalEncoder)
         }
@@ -74,6 +73,5 @@ def handler(event, context):
         print(f"CRITICAL ERROR: {str(e)}")
         return {
             "statusCode": 500,
-            "headers": { "Access-Control-Allow-Origin": "*" },
             "body": json.dumps({"error": "Internal Server Error", "details": str(e)})
         }

@@ -15,7 +15,6 @@ class DecimalEncoder(json.JSONEncoder):
         return super(DecimalEncoder, self).default(obj)
 
 # Initialize clients
-# Use s3v4 to ensure signature compatibility in all regions
 s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
 dynamodb = boto3.resource('dynamodb')
 
@@ -23,29 +22,29 @@ table = dynamodb.Table(os.environ['TABLE_NAME'])
 THUMB_BUCKET = os.environ['THUMB_BUCKET']
 
 def generate_presigned_url(s3_key):
-    """Generates a 5-minute temporary link for the private S3 object"""
+    """Generates a 15-minute temporary link for the private S3 object"""
     if not s3_key:
         return None
     return s3_client.generate_presigned_url(
         'get_object',
         Params={'Bucket': THUMB_BUCKET, 'Key': s3_key},
-        ExpiresIn=900 
+        ExpiresIn=900
     )
 
 def handler(event, context):
+    user_id = event['requestContext']['authorizer']['principalId']
     path_params = event.get('pathParameters') or {}
     query_params = event.get('queryStringParameters') or {}
-
     raw_tag = path_params.get('tag_name')
 
     try:
         if raw_tag:
+            # GALLERY VIEW: GET /tags/{tag_name}
             decoded_tag = urllib.parse.unquote(raw_tag)
-            search_key = f"TAG#{decoded_tag}" if not decoded_tag.startswith("TAG#") else decoded_tag
+            search_pk = f"USER#{user_id}#TAG#{decoded_tag}"
 
             query_args = {
-                "IndexName": 'GSI1',
-                "KeyConditionExpression": Key('GSI1PK').eq(search_key),
+                "KeyConditionExpression": Key('PK').eq(search_pk),
                 "Limit": 50
             }
 
@@ -57,13 +56,11 @@ def handler(event, context):
 
             clean_items = []
             for item in response.get('Items', []):
-                # Grab the raw S3 key from the DynamoDB record
                 s3_key = item.get('ThumbnailKey')
-
                 clean_items.append({
-                    "ImageId": item['SK'].replace("IMAGE#", ""), # Changed from image_id
-                    'ImageName': item.get('ImageName'),          # Keep PascalCase
-                    "Tag": item['PK'].replace("TAG#", ""),
+                    "ImageId": item['SK'].replace("IMAGE#", ""),
+                    'ImageName': item.get('ImageName'),
+                    "Tag": decoded_tag,
                     "ThumbnailUrl": generate_presigned_url(s3_key)
                 })
 
@@ -72,10 +69,7 @@ def handler(event, context):
 
             return {
                 "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
+                "headers": { "Content-Type": "application/json" },
                 "body": json.dumps({
                     "items": clean_items,
                     "next_token": encoded_token
@@ -84,7 +78,9 @@ def handler(event, context):
 
         else:
             # TAG CLOUD VIEW: GET /tags
-            response = table.query(KeyConditionExpression=Key('PK').eq('TAG_CLOUD'))
+            pk = f"USER#{user_id}#TAG_CLOUD"
+            response = table.query(KeyConditionExpression=Key('PK').eq(pk))
+
             data = []
             for i in response.get('Items', []):
                 data.append({
@@ -96,10 +92,7 @@ def handler(event, context):
 
             return {
                 "statusCode": 200,
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Access-Control-Allow-Origin": "*"
-                },
+                "headers": { "Content-Type": "application/json" },
                 "body": json.dumps(data, cls=DecimalEncoder)
             }
 
@@ -107,6 +100,5 @@ def handler(event, context):
         print(f"CRITICAL ERROR: {str(e)}")
         return {
             "statusCode": 500,
-            "headers": { "Access-Control-Allow-Origin": "*" },
-            "body": json.dumps({"error": str(e)}) # Leaking error for debugging; change to generic later
+            "body": json.dumps({"error": str(e)})
         }

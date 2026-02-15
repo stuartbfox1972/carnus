@@ -1,21 +1,53 @@
 import os
 import json
-import subprocess
 import re
 import io
 import time
 import hashlib
 import threading
+import brotli
+import base64
 from datetime import datetime
 from decimal import Decimal
+from urllib.parse import unquote_plus
 from PIL import Image
 import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key
 
-# --- GLOBAL STATE & LOCK ---
-_cloud_wiped = False
-_wipe_lock = threading.Lock()
+# --- IDEMPOTENCY HELPER ---
+def undo_old_metrics(user_id, image_id, table, settings):
+    """Subtracts old counts for tags and stats before re-processing an image."""
+    pk = f"USER#{user_id}#IMAGE"
+    sk = f"IMAGE#{image_id}"
+    try:
+        # Fetch existing tags and size to perform a precise decrement
+        resp = table.get_item(
+            Key={'PK': pk, 'SK': sk}, 
+            ProjectionExpression="Labels, Make, CameraModel, Lens, #sz", 
+            ExpressionAttributeNames={'#sz': 'Size'}
+        )
+        if 'Item' in resp:
+            old = resp['Item']
+            old_tags = set(old.get('Labels', []))
+            old_tags.update([old.get('Make'), old.get('CameraModel'), old.get('Lens')])
+            
+            # Revert Tag Cloud
+            for tag in {t for t in old_tags if t and t != 'Unknown'}:
+                table.update_item(
+                    Key={'PK': f"USER#{user_id}#TAG_CLOUD", 'SK': f'TAG#{tag}'},
+                    UpdateExpression="ADD #cnt :dec",
+                    ExpressionAttributeNames={'#cnt': 'Count'},
+                    ExpressionAttributeValues={':dec': -1}
+                )
+            # Revert Profile Stats
+            table.update_item(
+                Key={'PK': f"USER#{user_id}#PROFILE", 'SK': 'METADATA'},
+                UpdateExpression="ADD StorageBytesUsed :sz, ImageCount :inc",
+                ExpressionAttributeValues={':sz': -old.get('Size', 0), ':inc': -1}
+            )
+    except Exception as e:
+        if settings.get('debug'): print(f"⚠️ [UNDO] Reversion failed: {e}")
 
 # --- PRESERVED UTILITIES ---
 def parse_exif_numeric(val):
@@ -30,13 +62,29 @@ def parse_exif_numeric(val):
     except:
         return None
 
+def parse_gps(val, ref):
+    if not val: return None
+    try:
+        parts = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)", str(val))]
+        if not parts: return None
+        if len(parts) < 3:
+            decimal = parts[0]
+        else:
+            d, m, s = parts[:3]
+            decimal = d + (m / 60.0) + (s / 3600.0)
+        if ref and str(ref).strip().upper()[:1] in ['S', 'W']:
+            decimal = -decimal
+        return Decimal(str(round(decimal, 6)))
+    except:
+        return None
+
 def get_fuzzy_tag(data, pattern):
     matches = [
-        str(v).strip() for k, v in data.items()
+        (k, str(v).strip()) for k, v in data.items()
         if re.search(pattern, k, re.I) and v is not None and str(v).strip() != ""
     ]
     if not matches: return None
-    return sorted(matches, key=len, reverse=True)[0]
+    return sorted(matches, key=lambda x: len(x[0]))[0][1]
 
 def wrap_decimal(obj):
     if isinstance(obj, list): return [wrap_decimal(i) for i in obj]
@@ -47,65 +95,35 @@ def wrap_decimal(obj):
 def generate_short_id(s3_key):
     return hashlib.sha256(s3_key.encode()).hexdigest()[:12]
 
-# --- SELF-CONTAINED THREAD-SAFE WIPE ---
-def wipe_tag_cloud_if_needed(table, settings):
-    global _cloud_wiped
-    if _cloud_wiped or not settings.get('force_reprocess', False):
-        return
-    with _wipe_lock:
-        if _cloud_wiped:
-            return
-        if settings.get('debug'):
-            print("\n🗑️  [WIPE] force_reprocess is TRUE. Clearing Tag Cloud...")
-        try:
-            response = table.query(KeyConditionExpression=Key('PK').eq('TAG_CLOUD'))
-            items = response.get('Items', [])
-            if items:
-                with table.batch_writer() as batch:
-                    for item in items:
-                        batch.delete_item(Key={'PK': 'TAG_CLOUD', 'SK': item['SK']})
-            _cloud_wiped = True
-        except Exception as e:
-            print(f"⚠️  [WIPE] Failed to clear cloud: {e}")
-
 # --- MAIN PROCESSOR ---
-def process_image(file_path, settings, s3, rek, table):
-    wipe_tag_cloud_if_needed(table, settings)
+def process_image(img_data, user_id, settings, s3, rek, table):
+    filename = img_data['filename']
+    raw_exif = json.loads(brotli.decompress(base64.b64decode(img_data['exif'])))
+    preview_bytes = brotli.decompress(base64.b64decode(img_data['thumb']))
+    file_size = len(preview_bytes)
 
-    start_time = time.time()
-    filename = os.path.basename(file_path)
-    pk = f"IMAGE#{filename}"
+    exif_date_raw = get_fuzzy_tag(raw_exif, r'SubSecCreateDate|SubSecDateTimeOriginal|CreateDate|DateTimeOriginal|CreateDate$')
+    image_id = hashlib.sha256(f"{exif_date_raw}{filename}".encode()).hexdigest()[:10]
 
-    # 1. SKIP LOGIC
-    is_forcing = settings.get('force_reprocess', False)
-    if not is_forcing:
-        try:
-            response = table.query(KeyConditionExpression=Key('PK').eq(pk), ProjectionExpression="PK", Limit=1)
-            if response.get('Items'):
-                return
-        except ClientError:
-            pass
+    pk = f"USER#{user_id}#IMAGE"
+    sk = f"IMAGE#{image_id}"
 
-    # 2. EXIF EXTRACTION
-    meta_cmd = [settings['exiftool_path'], "-json", "-*", "-LensID", file_path]
-    result = subprocess.run(meta_cmd, capture_output=True, text=True)
-    raw_exif = json.loads(result.stdout)[0]
+    if settings.get('force_reprocess', False):
+        if img_data.get('force_reprocess', False) or settings.get('force_reprocess', False):
+            if settings.get('debug'): print(f"♻️ [FORCE] Correcting stats/tags for {image_id}")
+            undo_old_metrics(user_id, image_id, table, settings)
+    else:
+        existing = table.get_item(Key={'PK': pk, 'SK': sk}, ProjectionExpression="PK")
+        if 'Item' in existing: return
 
-    # 3. DATE LOGIC
-    exif_date_raw = get_fuzzy_tag(raw_exif, r'SubSecCreateDate|SubSecDateTimeOriginal|CreateDate|DateTimeOriginal')
     iso_date_str = re.sub(r'^(\d{4}):(\d{2}):(\d{2})', r'\1-\2-\3', str(exif_date_raw)).replace(" ", "T")
     dt_obj = datetime.fromisoformat(iso_date_str)
     dt_str = dt_obj.isoformat()
     date_path = dt_obj.strftime('%Y/%m/%d')
+    s3_key = f"protected/{user_id}/{date_path}/{filename}.jpg"
 
-    # 4. PREVIEW EXTRACTION & S3 UPLOAD
-    extract_cmd = [settings['exiftool_path'], "-b", "-JpgFromRaw", "-PreviewImage", file_path]
-    preview_bytes = subprocess.run(extract_cmd, capture_output=True).stdout
-    s3_key = f"{date_path}/{filename}.jpg"
     s3.put_object(Bucket=settings['assets_bucket'], Key=s3_key, Body=preview_bytes, ContentType='image/jpeg')
-    image_id = generate_short_id(s3_key)
 
-    # 5. AI REKOGNITION (Labels + Top-3 Face Analysis)
     img = Image.open(io.BytesIO(preview_bytes))
     img.thumbnail((1600, 1600))
     rek_buf = io.BytesIO()
@@ -115,108 +133,110 @@ def process_image(file_path, settings, s3, rek, table):
     rek_resp = rek.detect_labels(Image={'Bytes': rek_payload}, MaxLabels=15, MinConfidence=75)
     labels = [l['Name'] for l in rek_resp['Labels']] or ["Uncategorized"]
 
-    face_details = []
-    has_confident_face = any(l['Name'] == 'Face' and l['Confidence'] >= 75 for l in rek_resp['Labels'])
+    faces = []
+    if any(l['Name'] == 'Face' and l['Confidence'] > 75 for l in rek_resp['Labels']):
+        face_resp = rek.detect_faces(Image={'Bytes': rek_payload}, Attributes=['ALL'])
+        for face in face_resp.get('FaceDetails', [])[:3]:
+            faces.append({
+                "BoundingBox": face.get("BoundingBox"),
+                "AgeRange": face.get("AgeRange"),
+                "Gender": face.get("Gender") if face.get("Gender", {}).get("Confidence", 0) >= 60 else None,
+                "Smile": face.get("Smile") if face.get("Smile", {}).get("Confidence", 0) >= 60 else None,
+                "EyesOpen": face.get("EyesOpen") if face.get("EyesOpen", {}).get("Confidence", 0) >= 60 else None,
+                "MouthOpen": face.get("MouthOpen") if face.get("MouthOpen", {}).get("Confidence", 0) >= 60 else None,
+                "Emotions": [
+                    {"Type": e["Type"], "Confidence": e["Confidence"]}
+                    for e in face.get("Emotions", []) if e.get("Confidence", 0) >= 60
+                ]
+            })
 
-    if has_confident_face:
-        try:
-            face_resp = rek.detect_faces(Image={'Bytes': rek_payload}, Attributes=['ALL'])
-            top_faces = sorted(face_resp.get('FaceDetails', []), key=lambda x: x['Confidence'], reverse=True)[:3]
-            for face in top_faces:
-                f_data = {
-                    'BoundingBox': face['BoundingBox'],
-                    'Confidence': face['Confidence'],
-                    'Emotions': [e['Type'] for e in face.get('Emotions', []) if e['Confidence'] >= 75]
-                }
-                # Dynamically grab Booleans (Smile, EyesOpen, etc.)
-                for k, v in face.items():
-                    if isinstance(v, dict) and 'Value' in v and v.get('Confidence', 0) >= 75:
-                        f_data[k] = v['Value']
-                
-                # Age & Gender
-                if 'AgeRange' in face: f_data['AgeRange'] = face['AgeRange']
-                if face.get('Gender', {}).get('Confidence', 0) >= 75:
-                    f_data['Gender'] = face['Gender']['Value']
-                
-                face_details.append(f_data)
-        except Exception as e:
-            print(f"⚠️ Face Detection Error for {filename}: {e}")
+    lens_val = get_fuzzy_tag(raw_exif, r'LensID$|LensModel$|^Lens$')
+    camera_model = get_fuzzy_tag(raw_exif, r'Model$|UniqueCameraModel$')
+    make_val = get_fuzzy_tag(raw_exif, r'Make$|Manufacturer$')
 
-    # 6. ASSEMBLE DYNAMODB ITEM
-    lens_val = raw_exif.get('LensID') or get_fuzzy_tag(raw_exif, r'^LensModel$|^Lens$')
-    camera_model = raw_exif.get('Camera Model Name') or get_fuzzy_tag(raw_exif, r'^Model$')
+    hw_tags = [v for v in [make_val, camera_model, lens_val] if v and v != 'Unknown']
+    all_searchable_tags = set(labels + hw_tags)
+
+    gps_lat = parse_gps(get_fuzzy_tag(raw_exif, r'GPSLatitude$'), get_fuzzy_tag(raw_exif, r'GPSLatitudeRef$'))
+    gps_lon = parse_gps(get_fuzzy_tag(raw_exif, r'GPSLongitude$'), get_fuzzy_tag(raw_exif, r'GPSLongitudeRef$'))
 
     item_data = {
-        'PK': pk,
-        'SK': f"ID#{image_id}",
-        'ImageId': image_id,
-        'ImageName': filename,
-        'CaptureDate': dt_str,
-        'ProcessedAt': datetime.now().isoformat(),
-        'Labels': labels,
-        'Faces': face_details,
-        'ThumbnailKey': s3_key,
-        'Lens': lens_val or 'Unknown',
-        'CameraModel': camera_model or 'Unknown',
-        'ISO': parse_exif_numeric(get_fuzzy_tag(raw_exif, r'^ISO$')),
-        'Aperture': parse_exif_numeric(get_fuzzy_tag(raw_exif, r'^FNumber$|^Aperture$')),
-        'ShutterSpeed': get_fuzzy_tag(raw_exif, r'^ExposureTime$|^ShutterSpeed$'),
+        'PK': pk, 'SK': sk, 'UserId': user_id, 'ImageId': image_id, 'ImageName': filename,
+        'CaptureDate': dt_str, 'ProcessedAt': datetime.now().isoformat(),
+        'Labels': labels, 'Faces': faces, 'ThumbnailKey': s3_key, 'Size': file_size,
+        'Lens': lens_val or 'Unknown', 'CameraModel': camera_model or 'Unknown', 'Make': make_val or 'Unknown',
+        'GPSLatitude': gps_lat, 'GPSLongitude': gps_lon,
+        'ISO': parse_exif_numeric(get_fuzzy_tag(raw_exif, r'ISO$')),
+        'Aperture': parse_exif_numeric(get_fuzzy_tag(raw_exif, r'FNumber$|Aperture$')),
+        'ShutterSpeed': get_fuzzy_tag(raw_exif, r'ExposureTime$|ShutterSpeed$'),
         'exif': {}
     }
 
-    # 7. FILTER EXIF
-    omit = [r'MakerNotes', r'ThumbnailImage', r'PreviewImage', r'JpgFromRaw', r'ICC_Profile', r'^AF']
+    omit = [r'MakerNote', r'Image', r'Profile', r'Curve', r'Matrix', r'Data', r'Table']
     for key, value in raw_exif.items():
         if any(re.search(p, key, re.I) for p in omit): continue
-        if isinstance(value, (bytes, bytearray)) or (isinstance(value, str) and "(Binary data" in value): continue
+        if isinstance(value, (bytes, bytearray)) or "(Binary data" in str(value): continue
         safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', key).strip('_')
         item_data['exif'][safe_key] = value
-
-    # 8. DYNAMIC INDEXING
-    discovery_tags = set(labels)
-    if camera_model and camera_model != 'Unknown': discovery_tags.add(camera_model)
-    if lens_val and lens_val != 'Unknown': discovery_tags.add(lens_val)
-    
-    for face in face_details:
-        for k, v in face.items():
-            if k in ['BoundingBox', 'Confidence', 'Landmarks']: continue
-            if k == 'Emotions':
-                for emo in v: discovery_tags.add(emo.title())
-            elif k == 'AgeRange':
-                discovery_tags.add(f"Age {v['Low']}-{v['High']}")
-            elif isinstance(v, bool) and v is True:
-                # "EyesOpen" -> "Eyes Open"
-                tag_name = re.sub(r'([A-Z])', r' \1', k).strip().title()
-                discovery_tags.add(tag_name)
-            elif isinstance(v, str):
-                discovery_tags.add(v.title())
-
-    discovery_tags = {t for t in discovery_tags if t and str(t).strip()}
 
     try:
         with table.batch_writer() as batch:
             batch.put_item(Item=wrap_decimal(item_data))
-            for tag in discovery_tags:
+            for tag in {t for t in all_searchable_tags if t}:
                 batch.put_item(Item=wrap_decimal({
-                    'PK': f"TAG#{tag}",
-                    'SK': f"IMAGE#{image_id}",
-                    'GSI1PK': f"TAG#{tag}",
-                    'GSI1SK': f"IMAGE#{image_id}",
-                    'ImageName': filename,
-                    'ImageId': image_id,
-                    'Timestamp': dt_str,
-                    'ThumbnailKey': s3_key
+                    'PK': f"USER#{user_id}#TAG#{tag}", 'SK': sk,
+                    'GSI1PK': f"TAG#{tag}", 'GSI1SK': sk,
+                    'ImageName': filename, 'ImageId': image_id, 'Timestamp': dt_str, 'ThumbnailKey': s3_key
                 }))
 
-        for tag in discovery_tags:
+        for tag in {t for t in all_searchable_tags if t}:
             table.update_item(
-                Key={'PK': 'TAG_CLOUD', 'SK': f'TAG#{tag}'},
+                Key={'PK': f"USER#{user_id}#TAG_CLOUD", 'SK': f'TAG#{tag}'},
                 UpdateExpression="ADD #cnt :inc SET LabelName = :ln",
                 ExpressionAttributeNames={'#cnt': 'Count'},
                 ExpressionAttributeValues={':inc': 1, ':ln': tag}
             )
-    except Exception as e:
-        print(f"❌ DynamoDB Write Error: {e}")
 
-    if settings.get('debug'):
-        print(f"✅ {filename} ({(time.time()-start_time)*1000:.0f}ms)")
+        table.update_item(
+            Key={'PK': f"USER#{user_id}#PROFILE", 'SK': 'METADATA'},
+            UpdateExpression="ADD StorageBytesUsed :sz, ImageCount :inc",
+            ExpressionAttributeValues={':sz': file_size, ':inc': 1}
+        )
+    except Exception as e:
+        print(f"❌ DynamoDB Error: {e}")
+
+def lambda_handler(event, context):
+    s3 = boto3.client('s3')
+    rek = boto3.client('rekognition')
+    table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+    settings = {
+        'assets_bucket': os.environ['THUMB_BUCKET'],
+        'debug': os.environ.get('DEBUG', 'false').lower() == 'true'
+    }
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key = unquote_plus(record['s3']['object']['key'])
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        payload = json.loads(obj['Body'].read().decode('utf-8'))
+
+        key_parts = key.split('/')
+        path_user_id = key_parts[1] if len(key_parts) > 1 else None
+        payload_user_id = payload.get('user_id')
+
+        if path_user_id and payload_user_id and path_user_id != payload_user_id:
+            raise ValueError(f"Identity Mismatch! Path ID ({path_user_id}) != Payload ID ({payload_user_id})")
+
+        user_id = path_user_id or payload_user_id or 'unknown'
+        
+        if settings.get('debug'):
+            print(f"🚀 [PROCESS] User: {user_id} | Batch Size: {len(payload.get('images', []))} images")
+
+        for img in payload.get('images', []):
+            process_image(img, user_id, settings, s3, rek, table)
+
+        if not settings.get('debug'):
+            s3.delete_object(Bucket=bucket, Key=key)
+        else:
+            print(f"💾 [DEBUG] Preserving blob: {key}")
+
+    return {"statusCode": 200}

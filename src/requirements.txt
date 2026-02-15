@@ -1,9 +1,7 @@
-exifread>=3.0.0
-exif
-rawpy
-Pillow
-brotli
-pycognito
-boto3
-pyyaml
-tqdm
+pyyaml>=6.0
+rawpy>=0.18.0
+brotli>=1.0.9
+boto3>=1.26.0
+pillow>=9.4.0
+pycognito>=0.1.4
+tqdm>=4.64.0
